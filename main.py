@@ -11,6 +11,7 @@ AstrBot Twitter 推文转发插件
   /推特列表                                 - 查看当前订阅列表
   /推特推送 开启/关闭                       - 开启/关闭推送
   /推特测试 <推主id>                        - 立即获取并推送指定推主最新一条推文
+  /推特最新 <推主id> <图片|视频|媒体>        - 获取指定推主最新一条指定类型的推文
 
 配置项:
   【基础设置】
@@ -1036,6 +1037,41 @@ class TwitterPlugin(Star):
         except Exception as e:
             logger.error(f"推送推文至 {umo} 失败: {e}")
 
+    async def _dispatch_tweet_chain(self, umo: str, chain: list, nickname: str) -> bool:
+        """发送推文消息链；合并转发失败时回退为普通消息
+
+        直接通过 context.send_message 发送，便于在合并转发失败时捕获异常并回退，
+        避免 yield event.chain_result 延迟到 respond 阶段发送导致回退失效。
+
+        返回是否实际发送了内容。
+        """
+        if not chain:
+            return False
+        try:
+            if self.use_node:
+                nodes, video_parts = self._split_chain_for_nodes(chain, nickname)
+                if nodes:
+                    await self.context.send_message(
+                        umo, MessageChain(chain=[Nodes(nodes)])
+                    )
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
+            else:
+                plain_chain, video_parts = self._split_plain_chain_and_videos(chain)
+                if plain_chain:
+                    await self.context.send_message(
+                        umo, MessageChain(chain=plain_chain)
+                    )
+                for vid_comp in video_parts:
+                    await self._send_video_or_fallback(umo, vid_comp)
+        except Exception as node_err:
+            logger.warning(f"推文消息发送失败，尝试回退普通消息: {node_err}")
+            fallback_chain = self._build_plain_chain(chain)
+            if not fallback_chain:
+                return False
+            await self.context.send_message(umo, MessageChain(chain=fallback_chain))
+        return True
+
     async def _flush_collected_tweets(self):
         """将缓存的推文按推主分组打包为合并转发消息发送"""
         if not self._collected_tweets:
@@ -1638,6 +1674,86 @@ class TwitterPlugin(Star):
                 yield event.chain_result(plain_chain)
             for vid_comp in video_parts:
                 await self._send_video_or_fallback(umo, vid_comp)
+
+    @filter.command("推特最新", alias={"twitter_latest"})
+    async def latest_media_tweet(self, event: AstrMessageEvent):
+        """获取订阅推主最新指定类型的推文，格式: /推特最新 <推主id> <图片|视频|媒体>"""
+        if not self.twitter_api.nitter_url:
+            yield event.plain_result("镜像站不可用，请检查配置或网络")
+            return
+
+        tokens = event.message_str.strip().split()
+        if len(tokens) < 3:
+            yield event.plain_result(
+                "用法: /推特最新 <推主ID> <图片|视频|媒体>"
+            )
+            return
+
+        username = tokens[1].strip("@").strip()
+        type_map = {"图片": "image", "视频": "video", "媒体": "any"}
+        media_type = type_map.get(tokens[2].strip())
+        if media_type is None:
+            yield event.plain_result(
+                "不支持的类型，用法: /推特最新 <推主ID> <图片|视频|媒体>"
+            )
+            return
+        type_label = {"image": "图片", "video": "视频", "any": "媒体"}[media_type]
+
+        umo = event.unified_msg_origin
+        yield event.plain_result(f"正在获取 @{username} 的最新{type_label}推文，请稍候...")
+
+        # 获取时间线（最新在前），按媒体类型寻找命中的推文
+        timeline_items = await self.twitter_api.get_user_timeline_items(username)
+        if not timeline_items:
+            yield event.plain_result(f"未找到 @{username} 的推文")
+            return
+
+        selected_item = None
+        for item in timeline_items:
+            if item.get("is_retweet") and not self.include_retweets:
+                continue
+            item_media = item.get("media_type")
+            if media_type == "any":
+                if item_media in ("image", "video"):
+                    selected_item = item
+                    break
+            elif item_media == media_type:
+                selected_item = item
+                break
+
+        if not selected_item:
+            yield event.plain_result(
+                f"在 @{username} 最近的推文中未找到{type_label}推文"
+            )
+            return
+
+        tweet_id = str(selected_item.get("tweet_id") or "")
+        tweet_username = str(selected_item.get("username") or username)
+
+        # 获取推文详情
+        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
+        self._attach_timeline_item_metadata(tweet_info, selected_item)
+
+        # 翻译推文
+        translated_text, translate_model = await self._maybe_translate(
+            tweet_info, umo
+        )
+
+        # 构建消息链
+        chain = await self._build_tweet_message_chain(
+            username, tweet_info,
+            {"r18": True, "media": False, "status": True},
+            translated_text=translated_text,
+            translate_model=translate_model,
+        )
+        if not chain:
+            yield event.plain_result(f"未找到 @{username} 的推文内容")
+            return
+
+        author_username = str(tweet_info.get("username") or username)
+        screen_name = str(tweet_info.get("screen_name") or author_username)
+        nickname = self._build_author_display(author_username, screen_name)
+        await self._dispatch_tweet_chain(umo, chain, nickname)
 
     # ========== 链接识别 ==========
 

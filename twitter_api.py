@@ -246,6 +246,7 @@ class TwitterAPI:
                     "is_retweet": retweet_header is not None,
                     "retweeter_username": username,
                     "retweeter_screen_name": retweeter_screen_name,
+                    "media_type": self._detect_timeline_media_type(item),
                 }
             )
 
@@ -325,6 +326,24 @@ class TwitterAPI:
             if src:
                 images.append(self._absolute_url(src))
         return images
+
+    def _detect_timeline_media_type(self, item: Tag) -> Optional[str]:
+        """判断时间线条目主贴的媒体类型：image / video / None
+
+        仅看主贴媒体，排除嵌套引用帖（quote）内的媒体。
+        GIF 在 Nitter 中渲染为 <video>，归入 video。
+        """
+        def _hits(selector: str) -> bool:
+            return any(
+                not self._is_nested_quote_element(el, item)
+                for el in item.select(selector)
+            )
+
+        if _hits("div.attachment video") or _hits("div.video-overlay"):
+            return "video"
+        if _hits("a.still-image"):
+            return "image"
+        return None
 
     def _extract_videos(
         self, container: Tag, include_nested_quotes: bool = False
