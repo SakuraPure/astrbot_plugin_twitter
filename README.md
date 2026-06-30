@@ -9,7 +9,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10+-blue.svg?style=for-the-badge&color=76bad9)](https://www.python.org/)
 
-_✨ 基于 Nitter 镜像站的 Twitter 推文转发插件，支持多会话独立订阅、定时推送、链接识别、合并转发与推文翻译。 ✨_
+_✨ 基于 twikit 的 Twitter 推文转发插件，支持多会话独立订阅、定时推送、链接识别、合并转发与推文翻译。 ✨_
 
 </div>
 
@@ -55,7 +55,7 @@ _✨ 基于 Nitter 镜像站的 Twitter 推文转发插件，支持多会话独�
 ### 🔄 定时推送
 - **自动轮询** — 定时检测已订阅推主的最新推文并推送
 - **since_id 增量** — 基于 `since_id` 游标机制，仅推送新推文，避免重复
-- **Nitter 镜像自动切换** — 当前镜像不可用时自动轮换到下一个可用镜像
+- **twikit 账号登录** — 通过登录账号的 cookie 获取数据，无需自建镜像站
 - **集体转发模式** — 可选将一轮轮询内的多推主推文合并为一条转发消息
 - **转帖控制** — 可配置轮询推送和 `/推特测试` 是否包含转帖；转帖会标明谁转发/引用了谁，并附带原帖正文与媒体
 - **转帖去重** — 可选在轮询推送中对多个订阅推主转发的同一条原帖按会话去重
@@ -100,7 +100,10 @@ _✨ 基于 Nitter 镜像站的 Twitter 推文转发插件，支持多会话独�
 
 | 配置项 | 类型 | 默认值 | 说明 |
 |--------|------|--------|------|
-| `twitter_nitter_url` | string | （空） | Nitter 镜像站地址，留空则使用内置列表自动切换（内置列表仅有1个且可能失效，强烈建议自定义） |
+| `twitter_twikit_cookies_path` | string | `data/twikit_cookies.json` | twikit cookie 文件路径，推荐用 `twikit_login.py` 一次性生成 |
+| `twitter_twikit_username` | string | （空） | 自动登录用户名（可选，已用 cookie 时留空） |
+| `twitter_twikit_email` | string | （空） | 自动登录邮箱（可选） |
+| `twitter_twikit_password` | string | （空） | 自动登录密码（可选，敏感；已用 cookie 时留空） |
 | `twitter_proxy` | string | （空） | 代理地址，如 `http://127.0.0.1:7890` |
 | `twitter_poll_interval` | int | `5` | 推文轮询间隔（分钟），建议不低于 3 |
 
@@ -149,23 +152,30 @@ _✨ 基于 Nitter 镜像站的 Twitter 推文转发插件，支持多会话独�
    ```bash
    pip install -r requirements.txt
    ```
-3. 重启 AstrBot 或在 WebUI 中加载插件
+3. **生成 twikit cookie**（必需）：运行一次性登录脚本，按提示登录
+   ```bash
+   python twikit_login.py
+   ```
+   默认生成 `data/twikit_cookies.json`。也可在配置中填写 `twitter_twikit_username` / `twitter_twikit_password` 让插件自动登录生成。
+4. 重启 AstrBot 或在 WebUI 中加载插件
 
 ## 依赖
 
+- `twikit>=2.3.0`
 - `httpx[http2]>=0.25.0`
-- `beautifulsoup4>=4.12.0`
 
 ---
 
 ## 注意事项
 
 > [!WARNING]
-> - 本插件通过爬取 Nitter 镜像站获取推文数据，**不依赖 Twitter API**
-> - Nitter 镜像站可能随时失效，~~插件内置了多个镜像地址并支持自动切换~~
-> - **强烈建议自行部署 Nitter** 以保证稳定性，项目地址：[https://github.com/zedeus/nitter](https://github.com/zedeus/nitter)
-> - **Nitter本地部署教程**：https://mib7kzqsrf5.feishu.cn/wiki/O1ztwWl3GiBc4AknKvIcyaKsnFb?from=from_copylink
+> - 本插件通过 `twikit`（Twitter GraphQL 爬虫库）获取推文数据，**需要一个登录态的 Twitter 账号**
+> - 请先用 `twikit_login.py` 生成 cookie，或填写账号密码配置项让插件自动登录
+> - 账号可能被限流/风控；低频订阅（默认轮询 ≥3 分钟）通常无虞，但请勿用于高频大规模采集
+> - cookie 过期后需重新运行 `twikit_login.py` 登录
+> - 首次账号密码登录可能触发设备/邮箱验证，需按脚本提示交互完成
 > - 翻译功能需至少配置一个可用的 LLM Provider
+> - R18 自动识别功能在 twikit 后端下不生效（`is_r18` 恒为 `False`），R18 过滤配置项不再起作用
 
 > [!CAUTION]
 > **关于订阅隔离**：

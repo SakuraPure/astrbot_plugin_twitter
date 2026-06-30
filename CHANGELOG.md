@@ -1,3 +1,21 @@
+## v2.0.0 - 🔄 数据层迁移至 twikit
+
+### 重大变更
+- **移除 Nitter 依赖** — 数据获取层从 Nitter 镜像站迁移到 `twikit`（Twitter GraphQL 爬虫库），不再需要自建/寻找公共 Nitter 实例
+- **账号登录** — 需提供一个登录态的 Twitter 账号；推荐用 `twikit_login.py` 一次性生成 cookie，或在配置中填写账号密码让插件自动登录
+- 配置项 `twitter_nitter_url` 移除，新增 `twitter_twikit_cookies_path` / `twitter_twikit_username` / `twitter_twikit_email` / `twitter_twikit_password`
+
+### 变更
+- 媒体直链改用 `pbs.twimg.com` / `video.twimg.com`，不再经过镜像站代理
+- 移除镜像站自动轮换逻辑（不再需要）
+- 移除 `beautifulsoup4` 依赖，新增 `twikit>=2.3.0` 依赖
+
+### 已知限制
+- R18 自动识别在 twikit 后端下不生效（`is_r18` 恒为 `False`），R18 过滤配置项不再起作用
+- 受 Twitter 接口变更影响，twikit 偶发失效时需等待库更新
+
+---
+
 ## v1.6.0 - ✨ 新增转帖推文去重
 
 ### 新增功能

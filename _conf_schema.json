@@ -2,12 +2,30 @@
   "basic": {
     "description": "基础设置",
     "type": "object",
-    "hint": "Nitter 镜像站、代理与轮询等基础配置。",
+    "hint": "twikit 账号登录（cookie 或账号密码）、代理与轮询等基础配置。",
     "items": {
-      "twitter_nitter_url": {
-        "description": "Nitter 镜像站地址（留空则使用内置列表自动选择）",
+      "twitter_twikit_cookies_path": {
+        "description": "twikit cookie 文件路径",
         "type": "string",
-        "hint": "例如: https://nitter.net",
+        "hint": "如 data/twikit_cookies.json；留空则使用插件目录下 data/twikit_cookies.json。推荐用 twikit_login.py 一次性生成。",
+        "default": "data/twikit_cookies.json"
+      },
+      "twitter_twikit_username": {
+        "description": "twikit 登录用户名（可选）",
+        "type": "string",
+        "hint": "用于自动登录生成 cookie；已用 cookie 登录时留空即可",
+        "default": ""
+      },
+      "twitter_twikit_email": {
+        "description": "twikit 登录邮箱（可选）",
+        "type": "string",
+        "hint": "辅助验证用，可与用户名相同或留空",
+        "default": ""
+      },
+      "twitter_twikit_password": {
+        "description": "twikit 登录密码（可选，敏感）",
+        "type": "string",
+        "hint": "用于自动登录生成 cookie；已用 cookie 登录时留空即可",
         "default": ""
       },
       "twitter_proxy": {

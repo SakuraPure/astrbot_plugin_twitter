@@ -1,45 +1,134 @@
 """
 Twitter API 交互模块
-通过 Nitter 镜像站获取 Twitter/X 推文数据
+基于 twikit（Twitter GraphQL）获取 Twitter/X 推文数据，替代原 Nitter 方案。
 """
 
 import re
 from typing import Optional
 
 import httpx
-from bs4 import BeautifulSoup, Tag
+from twikit import Client
+from twikit.errors import TwitterException
 from astrbot.api import logger
-
-# 内置 Nitter 镜像站列表
-WEBSITE_LIST = [
-    "https://nitter.net",
-]
 
 # 有效的图片质量选项
 IMAGE_QUALITY_OPTIONS = ("large", "orig")
 
-# 直播推文链接特征（推文链接中包含此路径即为直播）
-BROADCAST_LINK_PATTERN = re.compile(r'/i/broadcasts/', re.IGNORECASE)
-
 
 class TwitterAPI:
-    """Twitter API 交互类，通过 Nitter 镜像站获取推文"""
+    """Twitter API 交互类，基于 twikit 通过登录账号获取推文"""
 
-    def __init__(self, proxy: Optional[str] = None, nitter_url: str = "",
-                 image_quality: str = "orig"):
+    def __init__(
+        self,
+        proxy: Optional[str] = None,
+        image_quality: str = "orig",
+        cookies_path: str = "",
+        username: str = "",
+        email: str = "",
+        password: str = "",
+    ):
         self.proxy = proxy
-        self.nitter_url = nitter_url
-        self.image_quality = image_quality if image_quality in IMAGE_QUALITY_OPTIONS else "orig"
-        self._client: Optional[httpx.AsyncClient] = None
+        self.image_quality = (
+            image_quality if image_quality in IMAGE_QUALITY_OPTIONS else "orig"
+        )
+        self.cookies_path = str(cookies_path or "").strip()
+        self.username = str(username or "").strip()
+        self.email = str(email or "").strip()
+        self.password = str(password or "").strip()
 
-    async def _get_client(self) -> httpx.AsyncClient:
-        """获取或创建异步 HTTP 客户端"""
-        if self._client is None or self._client.is_closed:
-            proxy = self.proxy if self.proxy else None
-            self._client = httpx.AsyncClient(
-                proxy=proxy,
+        # twikit 客户端
+        self.client: Optional[Client] = None
+        # 账号是否登录可用
+        self.available: bool = False
+
+        # 独立的 httpx 客户端，用于探测远程媒体文件大小
+        self._size_client: Optional[httpx.AsyncClient] = None
+
+    # ========== 认证 ==========
+
+    def _make_client(self) -> Client:
+        return Client(language="en-US", proxy=self.proxy or None)
+
+    async def ensure_login(self) -> bool:
+        """登录或加载 cookie，确保账号可用。返回是否可用。"""
+        self.client = self._make_client()
+
+        # 1) 优先加载已有 cookie
+        if self.cookies_path:
+            try:
+                self.client.load_cookies(self.cookies_path)
+                if await self._verify_session():
+                    self.available = True
+                    logger.info("twikit 已通过 cookie 登录，账号可用")
+                    return True
+                logger.warning("twikit cookie 已失效，尝试重新登录")
+            except FileNotFoundError:
+                logger.info("twikit cookie 文件不存在，将尝试账号密码登录")
+            except Exception as e:
+                logger.warning(f"twikit 加载 cookie 失败: {e}")
+
+        # 2) 回退：账号密码登录
+        if self.username and self.password:
+            try:
+                await self.client.login(
+                    auth_info_1=self.username,
+                    auth_info_2=self.email or None,
+                    password=self.password,
+                )
+                if self.cookies_path:
+                    self.client.save_cookies(self.cookies_path)
+                    logger.info(f"twikit 登录成功，cookie 已保存至 {self.cookies_path}")
+                else:
+                    logger.info("twikit 登录成功（未配置 cookie 路径，未持久化）")
+                self.available = True
+                return True
+            except Exception as e:
+                logger.error(f"twikit 账号密码登录失败: {e}")
+                self.available = False
+                return False
+
+        logger.error(
+            "twikit 登录失败：无可用 cookie，且未配置账号密码。"
+            "请运行 twikit_login.py 生成 cookie，或填写 twikit 账号密码配置项。"
+        )
+        self.available = False
+        return False
+
+    async def _verify_session(self) -> bool:
+        """发一次轻量请求验证 cookie 是否有效。"""
+        try:
+            await self.client.get_user_by_screen_name("x")
+            return True
+        except TwitterException as e:
+            logger.debug(f"twikit 会话验证失败（TwitterException）: {e}")
+            return False
+        except Exception as e:
+            logger.debug(f"twikit 会话验证失败: {e}")
+            return False
+
+    async def close(self):
+        """关闭客户端"""
+        if self._size_client and not self._size_client.is_closed:
+            await self._size_client.aclose()
+            self._size_client = None
+        # twikit 内部 http 客户端
+        if self.client is not None:
+            try:
+                http = getattr(self.client, "http", None)
+                if http is not None and not http.is_closed:
+                    await http.aclose()
+            except Exception:
+                pass
+        self.available = False
+
+    # ========== 远程文件大小探测（视频超限判断用） ==========
+
+    async def _get_size_client(self) -> httpx.AsyncClient:
+        if self._size_client is None or self._size_client.is_closed:
+            self._size_client = httpx.AsyncClient(
+                proxy=self.proxy or None,
                 http2=True,
-                timeout=30.0,
+                timeout=15.0,
                 follow_redirects=True,
                 headers={
                     "User-Agent": (
@@ -47,20 +136,12 @@ class TwitterAPI:
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/120.0.0.0 Safari/537.36"
                     ),
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
                 },
             )
-        return self._client
-
-    async def close(self):
-        """关闭 HTTP 客户端"""
-        if self._client and not self._client.is_closed:
-            await self._client.aclose()
-            self._client = None
+        return self._size_client
 
     @staticmethod
     def _parse_content_length(value: str) -> Optional[int]:
-        """解析正数形式的 Content-Length 响应头。"""
         try:
             length = int(str(value or "").strip())
         except (TypeError, ValueError):
@@ -69,7 +150,6 @@ class TwitterAPI:
 
     @staticmethod
     def _parse_content_range_total(value: str) -> Optional[int]:
-        """从 Content-Range 响应头解析文件总大小。"""
         match = re.search(r"/(\d+)\s*$", str(value or ""))
         if not match:
             return None
@@ -85,7 +165,7 @@ class TwitterAPI:
         if not url:
             return None
 
-        client = await self._get_client()
+        client = await self._get_size_client()
         try:
             resp = await client.head(url, timeout=15.0)
             if resp.status_code < 400:
@@ -116,23 +196,17 @@ class TwitterAPI:
             logger.debug(f"Range 探测远程文件大小失败: {url}, {e}")
             return None
 
-    async def check_website_available(self, website_list: list[str]) -> Optional[str]:
-        """检测可用的镜像站，返回第一个可用的 URL"""
-        client = await self._get_client()
-        for url in website_list:
-            try:
-                test_url = f"{url}/elonmusk"
-                resp = await client.get(test_url, timeout=15.0)
-                if resp.status_code == 200:
-                    logger.info(f"Nitter 镜像站可用: {url}")
-                    self.nitter_url = url
-                    return url
-                logger.debug(f"Nitter 镜像站不可用: {url}, 状态码: {resp.status_code}")
-            except Exception as e:
-                logger.debug(f"Nitter 镜像站检测异常: {url}, 错误: {e}")
-                continue
-        logger.warning("所有 Nitter 镜像站均不可用")
-        return None
+    # ========== 数据获取 ==========
+
+    async def _get_user(self, username: str):
+        """按用户名获取 twikit User 对象，失败返回 None。"""
+        if not self.available or self.client is None:
+            return None
+        try:
+            return await self.client.get_user_by_screen_name(username.strip("@"))
+        except Exception as e:
+            logger.error(f"获取用户信息失败 {username}: {e}")
+            return None
 
     async def get_user_info(self, username: str) -> dict:
         """获取 Twitter 用户信息
@@ -140,46 +214,22 @@ class TwitterAPI:
         返回:
             {"status": bool, "screen_name": str, "bio": str, "user_name": str}
         """
-        if not self.nitter_url:
+        user = await self._get_user(username)
+        if user is None:
             return {"status": False, "screen_name": "", "bio": "", "user_name": username}
 
-        client = await self._get_client()
-        url = f"{self.nitter_url}/{username}"
-        try:
-            resp = await client.get(url, timeout=15.0)
-            if resp.status_code != 200:
-                return {"status": False, "screen_name": "", "bio": "", "user_name": username}
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-
-            name_elem = soup.select_one("a.profile-card-fullname")
-            screen_name = name_elem.get_text(strip=True) if name_elem else username
-
-            bio_elem = soup.select_one("div.profile-bio")
-            bio = bio_elem.get_text(strip=True) if bio_elem else ""
-
-            return {
-                "status": True,
-                "screen_name": screen_name,
-                "bio": bio,
-                "user_name": username,
-            }
-        except Exception as e:
-            logger.error(f"获取用户信息失败 {username}: {e}")
-            return {"status": False, "screen_name": "", "bio": "", "user_name": username}
+        return {
+            "status": True,
+            "screen_name": str(getattr(user, "name", "") or username),
+            "bio": str(getattr(user, "description", "") or ""),
+            "user_name": str(getattr(user, "screen_name", "") or username),
+        }
 
     async def get_user_newtimeline(self, username: str, since_id: str = "") -> list[str]:
         """获取用户比 since_id 更新的推文 ID 列表
 
-        Nitter 时间线按最新优先排列，返回结果按时间正序（最旧在前）。
-
-        参数:
-            username: 推主用户名
-            since_id: 已知最新推文 ID，仅返回比此 ID 更新的推文；
-                      为空时仅返回最新一条推文 ID（用于首次订阅定位）
-
-        返回:
-            新推文 ID 列表（时间正序），无新推文时返回空列表
+        无 since_id 时仅返回最新一条推文 ID（用于首次订阅定位）。
+        返回结果按时间正序（最旧在前）。
         """
         items = await self.get_user_timeline_items(
             username,
@@ -188,65 +238,78 @@ class TwitterAPI:
         )
         return [str(item.get("tweet_id") or "") for item in items if item.get("tweet_id")]
 
-    def _parse_timeline_items(
-        self,
-        soup: BeautifulSoup,
-        username: str,
-        since_id: str = "",
-        limit: int = 0,
+    async def get_user_timeline_items(
+        self, username: str, since_id: str = "", limit: int = 0
     ) -> list[dict]:
-        """解析用户时间线条目。
+        """获取用户时间线条目，包含转帖元数据与媒体类型。
 
-        有 since_id 时返回时间正序（最旧在前）；无 since_id 时保持 Nitter 页面顺序
-        （最新在前），便于测试指令向后寻找下一条非转帖。
+        有 since_id 时返回时间正序（最旧在前）；无 since_id 时保持最新在前，
+        便于测试指令向后寻找下一条非转帖。
         """
-        timeline_items = soup.select("div.timeline-item")
+        if not self.available or self.client is None:
+            return []
+
+        user = await self._get_user(username)
+        if user is None:
+            return []
+
+        try:
+            result = await self.client.get_user_tweets(
+                user.id, "Tweets", count=20
+            )
+        except Exception as e:
+            logger.error(f"获取用户时间线失败 {username}: {e}")
+            return []
+
         parsed_items: list[dict] = []
+        for tweet in result:
+            is_retweet = getattr(tweet, "retweeted_tweet", None) is not None
+            src = tweet.retweeted_tweet or tweet
 
-        for item in timeline_items:
-            # 检测置顶推文标记并跳过
-            if item.select_one(".pinned, .icon-pin"):
+            tweet_id = str(getattr(src, "id", "") or "")
+            if not tweet_id:
                 continue
 
-            link = item.select_one("a.tweet-link")
-            if not link:
-                continue
+            src_user = getattr(src, "user", None)
+            author_username = (
+                getattr(src_user, "screen_name", "") or username
+                if src_user is not None
+                else username
+            )
 
-            href = link.get("href", "")
-            match = re.search(r"/([^/]+)/status/(\d+)", href)
-            if not match:
-                continue
-
-            tweet_username = match.group(1)
-            tweet_id = match.group(2)
-            retweet_header = item.select_one(".retweet-header")
-
+            # since_id 过滤（Twitter id 为 snowflake 数值，可比较）
             if since_id:
                 try:
                     if int(tweet_id) <= int(since_id):
-                        if retweet_header:
+                        if is_retweet:
                             continue
-                        # 时间线按最新优先，遇到 <= since_id 的即可停止
                         break
                 except ValueError:
                     continue
 
+            retweeter_username = ""
             retweeter_screen_name = ""
-            if retweet_header:
+            if is_retweet:
+                rt_user = getattr(tweet, "user", None)
+                retweeter_username = (
+                    getattr(rt_user, "screen_name", "") or username
+                    if rt_user is not None
+                    else username
+                )
                 retweeter_screen_name = (
-                    retweet_header.get_text(" ", strip=True)
-                    .replace("retweeted", "")
-                    .strip()
+                    getattr(rt_user, "name", "") or retweeter_username
+                    if rt_user is not None
+                    else retweeter_username
                 )
 
             parsed_items.append(
                 {
                     "tweet_id": tweet_id,
-                    "username": tweet_username or item.get("data-username") or username,
-                    "is_retweet": retweet_header is not None,
-                    "retweeter_username": username,
+                    "username": author_username,
+                    "is_retweet": is_retweet,
+                    "retweeter_username": retweeter_username,
                     "retweeter_screen_name": retweeter_screen_name,
-                    "media_type": self._detect_timeline_media_type(item),
+                    "media_type": self._detect_media_type(getattr(src, "media", None)),
                 }
             )
 
@@ -257,223 +320,30 @@ class TwitterAPI:
             parsed_items.reverse()
         return parsed_items
 
-    async def get_user_timeline_items(
-        self, username: str, since_id: str = "", limit: int = 0
-    ) -> list[dict]:
-        """获取用户时间线条目，包含转帖元数据。"""
-        if not self.nitter_url:
-            return []
-
-        client = await self._get_client()
-        url = f"{self.nitter_url}/{username}"
-        try:
-            resp = await client.get(url, timeout=15.0)
-            if resp.status_code != 200:
-                return []
-
-            soup = BeautifulSoup(resp.text, "html.parser")
-            return self._parse_timeline_items(
-                soup,
-                username=username,
-                since_id=since_id,
-                limit=limit,
-            )
-        except Exception as e:
-            logger.error(f"获取用户时间线失败 {username}: {e}")
-            return []
-
-    def _build_image_url(self, a_href: str, img_src: str) -> str:
-        """根据图片质量配置构建图片 URL
-        orig 原图：使用 <a> href（Nitter /pic/orig/ 路由，追加 name=orig&format=jpg）
-        large 缩略图：直接使用 <img> src 原样返回（Nitter 默认缩略图，webp 格式）
-        """
-        if self.image_quality == "orig":
-            return a_href
-        return img_src
-
-    def _absolute_url(self, url: str) -> str:
-        """将 Nitter 相对路径转换为绝对 URL。"""
-        if not url or url.startswith("http"):
-            return url
-        return f"{self.nitter_url}{url}"
-
-    @staticmethod
-    def _is_nested_quote_element(tag: Tag, root: Tag) -> bool:
-        """判断元素是否位于 root 内部的引用帖容器中。"""
-        for parent in tag.parents:
-            if parent is root:
-                return False
-            classes = parent.get("class") or []
-            if "quote" in classes:
-                return True
-        return False
-
-    def _extract_images(
-        self, container: Tag, include_nested_quotes: bool = False
-    ) -> list[str]:
-        """从指定容器提取图片 URL。"""
-        images: list[str] = []
-        attachments = container.select("a.still-image")
-        for a_tag in attachments:
-            if not include_nested_quotes and self._is_nested_quote_element(
-                a_tag, container
-            ):
-                continue
-            a_href = a_tag.get("href", "")
-            img = a_tag.select_one("img")
-            img_src = img.get("src", "") if img else ""
-            src = self._build_image_url(a_href, img_src)
-            if src:
-                images.append(self._absolute_url(src))
-        return images
-
-    def _detect_timeline_media_type(self, item: Tag) -> Optional[str]:
-        """判断时间线条目主贴的媒体类型：image / video / None
-
-        仅看主贴媒体，排除嵌套引用帖（quote）内的媒体。
-        GIF 在 Nitter 中渲染为 <video>，归入 video。
-        """
-        def _hits(selector: str) -> bool:
-            return any(
-                not self._is_nested_quote_element(el, item)
-                for el in item.select(selector)
-            )
-
-        if _hits("div.attachment video") or _hits("div.video-overlay"):
-            return "video"
-        if _hits("a.still-image"):
-            return "image"
-        return None
-
-    def _extract_videos(
-        self, container: Tag, include_nested_quotes: bool = False
-    ) -> list[str]:
-        """从指定容器提取视频/GIF URL。"""
-        videos: list[str] = []
-        video_elems = container.select("div.attachment video")
-        seen_urls: set[str] = set()
-        for video in video_elems:
-            if not include_nested_quotes and self._is_nested_quote_element(
-                video, container
-            ):
-                continue
-            for source in video.find_all("source"):
-                src = source.get("src", "")
-                if src:
-                    src = self._absolute_url(src)
-                    if src not in seen_urls:
-                        seen_urls.add(src)
-                        videos.append(src)
-
-            src = video.get("src", "")
-            if src:
-                src = self._absolute_url(src)
-                if src not in seen_urls:
-                    seen_urls.add(src)
-                    videos.append(src)
-
-            data_url = video.get("data-url", "")
-            if data_url:
-                data_url = self._absolute_url(data_url)
-                if data_url not in seen_urls:
-                    seen_urls.add(data_url)
-                    videos.append(data_url)
-        return videos
-
-    def _extract_video_previews(
-        self, container: Tag, include_nested_quotes: bool = False
-    ) -> list[dict]:
-        """提取截图渲染用的视频封面图。"""
-        previews: list[dict] = []
-        seen_posters: set[str] = set()
-        video_elems = container.select("div.attachment video")
-        for video in video_elems:
-            if not include_nested_quotes and self._is_nested_quote_element(
-                video, container
-            ):
-                continue
-            poster = self._absolute_url(video.get("poster", ""))
-            if poster and poster not in seen_posters:
-                seen_posters.add(poster)
-                previews.append({"poster": poster, "duration": ""})
-
-        overlay_elems = container.select("div.video-overlay")
-        for overlay in overlay_elems:
-            if not include_nested_quotes and self._is_nested_quote_element(
-                overlay, container
-            ):
-                continue
-            attachment = overlay.find_parent("div", class_="attachment")
-            img = attachment.select_one("img") if attachment else None
-            poster = self._absolute_url(img.get("src", "")) if img else ""
-            duration_elem = overlay.select_one(".overlay-duration")
-            duration = duration_elem.get_text(strip=True) if duration_elem else ""
-            if poster and poster not in seen_posters:
-                seen_posters.add(poster)
-                previews.append({"poster": poster, "duration": duration})
-        return previews
-
-    def _extract_avatar(self, container: Tag) -> str:
-        """从 Nitter 推文容器提取头像 URL。"""
-        avatar_img = container.select_one("a.tweet-avatar img, img.avatar")
-        if not avatar_img:
-            return ""
-        return self._absolute_url(avatar_img.get("src", ""))
-
-    def _has_verified_badge(
-        self, container: Tag, include_nested_quotes: bool = False
-    ) -> bool:
-        """判断推文容器中是否存在可见的认证标记。"""
-        for badge in container.select(".verified-icon"):
-            if not include_nested_quotes and self._is_nested_quote_element(
-                badge, container
-            ):
-                continue
-            return True
-        return False
-
-    @staticmethod
-    def _extract_date(container: Tag) -> str:
-        """Extract the visible tweet date from a Nitter tweet container."""
-        date_link = container.select_one("span.tweet-date a")
-        if not date_link:
-            return ""
-        return date_link.get_text(strip=True) or date_link.get("title", "")
-
-    @staticmethod
-    def _extract_stats(container: Tag) -> dict:
-        """Extract visible tweet stats from Nitter's action row."""
-        stats = {"comments": "", "retweets": "", "likes": "", "views": ""}
-        stat_elems = container.select("div.tweet-stats span.tweet-stat")
-        stat_keys = ("comments", "retweets", "likes", "views")
-        for key, stat_elem in zip(stat_keys, stat_elems):
-            text = stat_elem.get_text(" ", strip=True)
-            stats[key] = text
-        return stats
-
-    def _contains_live_stream(
-        self, container: Tag, include_nested_quotes: bool = False
-    ) -> bool:
-        """检测容器内是否包含直播链接。"""
-        for link in container.select("a"):
-            if not include_nested_quotes and self._is_nested_quote_element(
-                link, container
-            ):
-                continue
-            href = link.get("href", "")
-            if href and BROADCAST_LINK_PATTERN.search(href):
-                return True
-        return False
-
     async def get_tweet(self, username: str, tweet_id: str) -> dict:
         """获取推文详细信息
 
         返回:
-            推文信息字典，包含 text, images, videos, quote, is_r18,
-            screen_name, retweet 等
+            推文信息字典，包含 text, images, videos, video_previews, quote,
+            is_r18, screen_name, retweet 等
         """
-        result = {
-            "tweet_id": tweet_id,
+        if not self.available or self.client is None:
+            return self._empty_tweet(tweet_id, username)
+
+        try:
+            tweet = await self.client.get_tweet_by_id(str(tweet_id))
+        except Exception as e:
+            logger.error(f"获取推文详情失败 {username}/{tweet_id}: {e}")
+            return self._empty_tweet(tweet_id, username)
+
+        return self._tweet_to_info(tweet, fallback_username=username)
+
+    # ========== 推文数据映射 ==========
+
+    @staticmethod
+    def _empty_tweet(tweet_id: str, username: str) -> dict:
+        return {
+            "tweet_id": str(tweet_id or ""),
             "username": username,
             "screen_name": username,
             "avatar": "",
@@ -489,150 +359,162 @@ class TwitterAPI:
             "is_r18": False,
         }
 
-        if not self.nitter_url:
-            return result
-
-        client = await self._get_client()
-        nitter_url = f"{self.nitter_url}/{username}/status/{tweet_id}"
-
+    @staticmethod
+    def _format_count(value) -> str:
+        if value is None:
+            return ""
         try:
-            resp = await client.get(nitter_url, timeout=20.0)
-            if resp.status_code != 200:
-                logger.warning(f"获取推文失败: {nitter_url}, 状态码: {resp.status_code}")
-                return result
+            return str(int(value))
+        except (TypeError, ValueError):
+            return str(value or "")
 
-            soup = BeautifulSoup(resp.text, "html.parser")
+    @staticmethod
+    def _format_duration(duration_millis) -> str:
+        try:
+            total = int(duration_millis or 0) // 1000
+        except (TypeError, ValueError):
+            return ""
+        if total <= 0:
+            return ""
+        minutes, seconds = divmod(total, 60)
+        return f"{minutes}:{seconds:02d}"
 
-            # 限定在主贴容器内，避免匹配评论/回复区内容
-            # Nitter 推文详情页：主贴在 div.main-tweet 内，评论在其后
-            main_tweet = soup.select_one("div.main-tweet")
-            if not main_tweet:
-                logger.warning(f"未找到 div.main-tweet 容器: {nitter_url}")
-                return result
+    def _build_image_url(self, url: str) -> str:
+        """根据图片质量配置构建图片 URL（twimg 直链追加 name 参数）。"""
+        url = str(url or "").strip()
+        if not url:
+            return ""
+        quality = "orig" if self.image_quality == "orig" else "large"
+        # 已带查询参数则避免重复（如格式后缀）
+        if "?" in url:
+            if "name=" in url:
+                return url
+            return f"{url}&name={quality}&format=jpg"
+        return f"{url}?name={quality}&format=jpg"
 
-            # 获取显示名称
-            fullname_elem = main_tweet.select_one("a.fullname")
-            if fullname_elem:
-                result["screen_name"] = fullname_elem.get_text(strip=True)
+    @staticmethod
+    def _detect_media_type(media) -> Optional[str]:
+        """根据 twikit 媒体列表判定媒体类型：image / video / None。
 
-            username_elem = main_tweet.select_one("a.username")
-            if username_elem:
-                result["username"] = username_elem.get_text(strip=True).lstrip("@")
-
-            result["avatar"] = self._extract_avatar(main_tweet)
-            result["verified"] = self._has_verified_badge(main_tweet)
-            result["date"] = self._extract_date(main_tweet)
-            result["stats"] = self._extract_stats(main_tweet)
-
-            # 获取推文正文
-            content_elem = main_tweet.select_one("div.tweet-content.media-body")
-            if content_elem:
-                result["text"] = content_elem.get_text(strip=True)
-
-            # 获取图片（仅主贴，排除视频/GIF缩略图）
-            result["images"] = self._extract_images(main_tweet)
-
-            # 获取视频/GIF（仅主贴）
-            # Nitter 视频有三种HTML形态：
-            #   1) mp4播放启用: <video><source src=""></video>
-            #   2) m3u8/vmap格式: <video data-url=""> (无src/source)
-            #   3) 播放被禁用: 仅有 <img> 缩略图 + <div class="video-overlay">
-            result["videos"] = self._extract_videos(main_tweet)
-            result["video_previews"] = self._extract_video_previews(main_tweet)
-
-            # 检测直播推文并过滤
-            is_live_stream = self._contains_live_stream(main_tweet)
-
-            if is_live_stream:
-                logger.info(
-                    f"检测到直播/流媒体视频 @{username}/{tweet_id}，"
-                    f"过滤所有媒体内容"
-                )
-                result["videos"] = []
-                result["images"] = []
-                result["video_previews"] = []
-
-            # 检测视频附件但未提取到视频URL的情况
-            if not is_live_stream:
-                video_overlays = main_tweet.select("div.video-overlay")
-                if video_overlays and not result["videos"]:
-                    logger.warning(
-                        f"检测到视频附件但未提取到视频URL，"
-                        f"可能 Nitter 实例({self.nitter_url})禁用了视频播放。"
-                        f"请在 Nitter 配置中设置 hlsPlayback = true 且 proxyVideo = false"
-                    )
-
-            # 获取引用推文（仅主贴）
-            quote_elem = main_tweet.select_one("div.quote")
-            if quote_elem:
-                quote_text_elem = quote_elem.select_one(
-                    "div.quote-text, div.tweet-content"
-                )
-                quote_author = quote_elem.select_one("a.fullname")
-                quote_username = quote_elem.select_one("a.username")
-                quote_link = quote_elem.select_one("a.quote-link")
-                quote_href = quote_link.get("href", "") if quote_link else ""
-                quote_id_match = re.search(r"/status/(\d+)", quote_href)
-                quote_live_stream = self._contains_live_stream(
-                    quote_elem,
-                    include_nested_quotes=True,
-                )
-                result["quote"] = {
-                    "author": quote_author.get_text(strip=True) if quote_author else "",
-                    "username": (
-                        quote_username.get_text(strip=True).lstrip("@")
-                        if quote_username
-                        else ""
-                    ),
-                    "avatar": self._extract_avatar(quote_elem),
-                    "verified": self._has_verified_badge(
-                        quote_elem,
-                        include_nested_quotes=True,
-                    ),
-                    "date": self._extract_date(quote_elem),
-                    "tweet_id": quote_id_match.group(1) if quote_id_match else "",
-                    "text": quote_text_elem.get_text(strip=True) if quote_text_elem else "",
-                    "images": (
-                        []
-                        if quote_live_stream
-                        else self._extract_images(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
-                    "videos": (
-                        []
-                        if quote_live_stream
-                        else self._extract_videos(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
-                    "video_previews": (
-                        []
-                        if quote_live_stream
-                        else self._extract_video_previews(
-                            quote_elem,
-                            include_nested_quotes=True,
-                        )
-                    ),
-                }
-
-            # 检测 R18 标记（仅主贴）
-            r18_elem = main_tweet.select_one(".nsfw")
-            result["is_r18"] = r18_elem is not None
-
-        except Exception as e:
-            logger.error(f"获取推文详情失败 {username}/{tweet_id}: {e}")
-
-        return result
-
-def get_next_website(website_list: list[str], current: str) -> Optional[str]:
-    """获取列表中当前镜像站的下一个（循环）"""
-    if not website_list:
+        GIF 在 twikit 中为 AnimatedGif，归入 video。
+        """
+        if not media:
+            return None
+        for m in media:
+            # Video / AnimatedGif 拥有 video_info 属性
+            if hasattr(m, "video_info"):
+                return "video"
+        for m in media:
+            if hasattr(m, "media_url"):
+                return "image"
         return None
-    try:
-        idx = website_list.index(current)
-        return website_list[(idx + 1) % len(website_list)]
-    except ValueError:
-        return website_list[0]
+
+    def _extract_media(self, media) -> tuple[list[str], list[str], list[dict]]:
+        """从 twikit 媒体列表提取 (images, videos, video_previews)。"""
+        images: list[str] = []
+        videos: list[str] = []
+        video_previews: list[dict] = []
+
+        for m in media or []:
+            if hasattr(m, "video_info"):
+                url = self._pick_video_url(m)
+                if url:
+                    videos.append(url)
+                poster = str(getattr(m, "media_url", "") or "").strip()
+                preview = {"poster": poster, "duration": self._format_duration(getattr(m, "duration_millis", 0))}
+                if poster:
+                    video_previews.append(preview)
+            elif hasattr(m, "media_url"):
+                url = self._build_image_url(getattr(m, "media_url", ""))
+                if url:
+                    images.append(url)
+
+        return images, videos, video_previews
+
+    @staticmethod
+    def _pick_video_url(video_media) -> str:
+        """从 video_info.variants 中选取最高码率的 mp4 直链。
+
+        跳过 m3u8/vmap 流媒体清单（无法直发）。
+        """
+        video_info = getattr(video_media, "video_info", None) or {}
+        variants = video_info.get("variants") or []
+
+        mp4_candidates = []
+        for v in variants:
+            url = str(v.get("url", "") or "")
+            content_type = str(v.get("content_type", "") or "")
+            if not url:
+                continue
+            # 跳过流媒体清单
+            lower = url.lower()
+            if ".m3u8" in lower or "vmap" in lower:
+                continue
+            if content_type == "video/mp4":
+                try:
+                    bitrate = int(v.get("bitrate") or 0)
+                except (TypeError, ValueError):
+                    bitrate = 0
+                mp4_candidates.append((bitrate, url))
+
+        if mp4_candidates:
+            mp4_candidates.sort(key=lambda x: x[0], reverse=True)
+            return mp4_candidates[0][1]
+
+        # 回退：任一非流媒体变体
+        for v in variants:
+            url = str(v.get("url", "") or "")
+            if url and ".m3u8" not in url.lower() and "vmap" not in url.lower():
+                return url
+        return ""
+
+    def _quote_to_dict(self, quote) -> Optional[dict]:
+        if quote is None:
+            return None
+        q_user = getattr(quote, "user", None)
+        images, videos, video_previews = self._extract_media(getattr(quote, "media", None))
+        return {
+            "author": str(getattr(q_user, "name", "") or "") if q_user else "",
+            "username": str(getattr(q_user, "screen_name", "") or "") if q_user else "",
+            "avatar": str(getattr(q_user, "profile_image_url", "") or "") if q_user else "",
+            "verified": bool(getattr(q_user, "verified", False)) if q_user else False,
+            "date": str(getattr(quote, "created_at", "") or ""),
+            "tweet_id": str(getattr(quote, "id", "") or ""),
+            "text": str(getattr(quote, "full_text", None) or getattr(quote, "text", "") or ""),
+            "images": images,
+            "videos": videos,
+            "video_previews": video_previews,
+        }
+
+    def _tweet_to_info(self, tweet, fallback_username: str = "") -> dict:
+        user = getattr(tweet, "user", None)
+        username = str(getattr(user, "screen_name", "") or fallback_username) if user else fallback_username
+        screen_name = str(getattr(user, "name", "") or username) if user else username
+
+        images, videos, video_previews = self._extract_media(getattr(tweet, "media", None))
+
+        text = str(getattr(tweet, "full_text", None) or getattr(tweet, "text", "") or "")
+
+        stats = {
+            "comments": self._format_count(getattr(tweet, "reply_count", None)),
+            "retweets": self._format_count(getattr(tweet, "retweet_count", None)),
+            "likes": self._format_count(getattr(tweet, "favorite_count", None)),
+            "views": self._format_count(getattr(tweet, "view_count", None)),
+        }
+
+        return {
+            "tweet_id": str(getattr(tweet, "id", "") or ""),
+            "username": username,
+            "screen_name": screen_name,
+            "avatar": str(getattr(user, "profile_image_url", "") or "") if user else "",
+            "verified": bool(getattr(user, "verified", False)) if user else False,
+            "date": str(getattr(tweet, "created_at", "") or ""),
+            "stats": stats,
+            "text": text,
+            "images": images,
+            "videos": videos,
+            "video_previews": video_previews,
+            "quote": self._quote_to_dict(getattr(tweet, "quote", None)),
+            "retweet": None,
+            "is_r18": False,
+        }

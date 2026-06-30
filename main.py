@@ -1,6 +1,6 @@
 """
 AstrBot Twitter 推文转发插件
-基于 Nitter 镜像站，支持订阅推主、定时推送、链接识别、合并转发消息、推文翻译
+基于 twikit 登录账号获取推文，支持订阅推主、定时推送、链接识别、合并转发消息、推文翻译
 
 指令列表:
   /推特关注 <推主id> [r18] [媒体]          - 订阅推主
@@ -15,7 +15,10 @@ AstrBot Twitter 推文转发插件
 
 配置项:
   【基础设置】
-    Nitter 镜像站地址 (twitter_nitter_url)        - 留空则自动选择
+    twikit cookie 路径 (twitter_twikit_cookies_path) - 如 data/twikit_cookies.json
+    twikit 用户名 (twitter_twikit_username)        - 自动登录用（可选）
+    twikit 邮箱 (twitter_twikit_email)              - 自动登录用（可选）
+    twikit 密码 (twitter_twikit_password)          - 自动登录用（可选，敏感）
     代理地址 (twitter_proxy)                      - 如 http://127.0.0.1:7890
     轮询间隔 (twitter_poll_interval)              - 默认 5 分钟
   【消息格式】
@@ -46,7 +49,7 @@ from astrbot.api.message_components import Node, Nodes
 from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
-from .twitter_api import TwitterAPI, WEBSITE_LIST, get_next_website
+from .twitter_api import TwitterAPI
 from .twitter_renderer import (
     build_tweet_card_context,
     load_tweet_card_template,
@@ -93,6 +96,19 @@ class TwitterPlugin(Star):
                 return val
 
         return default
+
+    @staticmethod
+    def _resolve_cookies_path(path: str) -> str:
+        """将 cookie 路径解析为相对插件目录的绝对路径；空则返回空。"""
+        path = str(path or "").strip()
+        if not path:
+            return ""
+        from pathlib import Path
+
+        p = Path(path)
+        if not p.is_absolute():
+            p = Path(__file__).resolve().parent / p
+        return str(p)
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -199,22 +215,30 @@ class TwitterPlugin(Star):
         self.translate_custom_prompt = str(
             self._cfg("translation", "twitter_translate_custom_prompt", "") or ""
         ).strip()
-        self.custom_nitter_url = str(
-            self._cfg("basic", "twitter_nitter_url", "") or ""
+        self.twikit_cookies_path = str(
+            self._cfg("basic", "twitter_twikit_cookies_path", "") or ""
+        ).strip()
+        self.twikit_username = str(
+            self._cfg("basic", "twitter_twikit_username", "") or ""
+        ).strip()
+        self.twikit_email = str(
+            self._cfg("basic", "twitter_twikit_email", "") or ""
+        ).strip()
+        self.twikit_password = str(
+            self._cfg("basic", "twitter_twikit_password", "") or ""
         ).strip()
         self.image_quality = str(
             self._cfg("message_format", "twitter_image_quality", "orig") or "orig"
         ).strip()
 
-        # 构建镜像站列表
-        self.website_list: list[str] = []
-        if self.custom_nitter_url:
-            self.website_list.append(self.custom_nitter_url)
-        self.website_list.extend(WEBSITE_LIST)
-
-        # 初始化 Twitter API
+        # 初始化 Twitter API（twikit 后端）
         self.twitter_api = TwitterAPI(
-            proxy=self.proxy, nitter_url="", image_quality=self.image_quality
+            proxy=self.proxy,
+            image_quality=self.image_quality,
+            cookies_path=self._resolve_cookies_path(self.twikit_cookies_path),
+            username=self.twikit_username,
+            email=self.twikit_email,
+            password=self.twikit_password,
         )
 
         # 定时任务句柄
@@ -235,15 +259,16 @@ class TwitterPlugin(Star):
                 "请同时开启「使用合并转发消息」配置项。"
             )
 
-        # 检测可用镜像站
-        available = await self.twitter_api.check_website_available(self.website_list)
-        if available:
-            logger.info(f"当前使用 Nitter 镜像站: {available}")
-        else:
-            logger.warning("未找到可用 Nitter 镜像站，推文轮询功能暂不可用")
+        # 登录 twikit 账号（加载 cookie 或账号密码登录）
+        available = await self.twitter_api.ensure_login()
+        if not available:
+            logger.warning(
+                "twikit 账号未登录，推文功能暂不可用。"
+                "请运行 twikit_login.py 生成 cookie，或在配置中填写 twikit 账号密码。"
+            )
 
         # 启动定时轮询任务
-        if self.twitter_api.nitter_url:
+        if self.twitter_api.available:
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_tweets())
             logger.info(f"推文轮询已启动，间隔 {self.poll_interval} 分钟")
@@ -1218,30 +1243,16 @@ class TwitterPlugin(Star):
         if not subscribe_list:
             return
 
-        results: list[bool] = []
         for username, info in subscribe_list.items():
             try:
-                result = await self._check_user_tweets(username, info)
-                results.append(result)
+                await self._check_user_tweets(username, info)
                 await asyncio.sleep(3)  # 避免频繁请求
             except Exception as e:
                 logger.error(f"检查 {username} 推文失败: {e}")
-                results.append(False)
 
         # 集体转发模式：轮询结束后统一发送缓存的推文
         if self.collective_forward and self._collected_tweets:
             await self._flush_collected_tweets()
-
-        # 自动切换镜像站
-        if not self.custom_nitter_url and results:
-            success_count = sum(1 for r in results if r)
-            if success_count < len(results) / 2 and self.website_list:
-                new_url = get_next_website(
-                    self.website_list, self.twitter_api.nitter_url
-                )
-                if new_url and new_url != self.twitter_api.nitter_url:
-                    logger.info(f"当前镜像站出错过多，切换至: {new_url}")
-                    self.twitter_api.nitter_url = new_url
 
     async def _check_user_tweets(self, username: str, info: dict) -> bool:
         """检查某个用户的新推文，返回是否成功获取"""
@@ -1298,8 +1309,8 @@ class TwitterPlugin(Star):
     @filter.command("推特关注", alias={"twitter_follow"})
     async def follow_twitter(self, event: AstrMessageEvent, username: str = ""):
         """订阅推主，格式: /推特关注 <推主id> [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.twitter_api.available:
+            yield event.plain_result("账号未登录，请检查 twikit cookie 或账号密码配置")
             return
 
         if not username:
@@ -1363,8 +1374,8 @@ class TwitterPlugin(Star):
     @filter.command("推特批量关注", alias={"twitter_batch_follow"})
     async def batch_follow_twitter(self, event: AstrMessageEvent):
         """批量订阅推主，格式: /推特批量关注 <推主id1> <推主id2> ... [r18] [媒体]"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.twitter_api.available:
+            yield event.plain_result("账号未登录，请检查 twikit cookie 或账号密码配置")
             return
 
         # 解析消息：提取用户名和选项
@@ -1594,8 +1605,8 @@ class TwitterPlugin(Star):
     @filter.command("推特测试", alias={"twitter_test"})
     async def test_tweet(self, event: AstrMessageEvent, username: str = ""):
         """立即获取并推送指定推主的最新一条推文，格式: /推特测试 <推主id>"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.twitter_api.available:
+            yield event.plain_result("账号未登录，请检查 twikit cookie 或账号密码配置")
             return
 
         if not username:
@@ -1678,8 +1689,8 @@ class TwitterPlugin(Star):
     @filter.command("推特最新", alias={"twitter_latest"})
     async def latest_media_tweet(self, event: AstrMessageEvent):
         """获取订阅推主最新指定类型的推文，格式: /推特最新 <推主id> <图片|视频|媒体>"""
-        if not self.twitter_api.nitter_url:
-            yield event.plain_result("镜像站不可用，请检查配置或网络")
+        if not self.twitter_api.available:
+            yield event.plain_result("账号未登录，请检查 twikit cookie 或账号密码配置")
             return
 
         tokens = event.message_str.strip().split()
@@ -1778,7 +1789,7 @@ class TwitterPlugin(Star):
 
         logger.info(f"检测到推文链接: {link}")
 
-        if not self.twitter_api.nitter_url:
+        if not self.twitter_api.available:
             return
 
         try:
