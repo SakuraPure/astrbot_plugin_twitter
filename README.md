@@ -152,6 +152,7 @@ _✨ 基于 twikit 的 Twitter 推文转发插件，支持多会话独立订阅�
    ```bash
    pip install -r requirements.txt
    ```
+   > 依赖使用 `twifork`（twikit 的维护分支，原版已失效），Python 中仍以 `import twikit` 导入。
 3. **生成 twikit cookie**（必需）：运行一次性登录脚本，按提示登录
    ```bash
    python twikit_login.py
@@ -161,7 +162,7 @@ _✨ 基于 twikit 的 Twitter 推文转发插件，支持多会话独立订阅�
 
 ## 依赖
 
-- `twikit>=2.3.0`
+- `twifork>=2.3.4`（twikit 维护分支，import 名仍为 `twikit`）
 - `httpx[http2]>=0.25.0`
 
 ---

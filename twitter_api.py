@@ -47,7 +47,12 @@ class TwitterAPI:
     # ========== 认证 ==========
 
     def _make_client(self) -> Client:
-        return Client(language="en-US", proxy=self.proxy or None)
+        # impersonate 浏览器 TLS 指纹，规避 X 边缘对 httpx 原生指纹的 403
+        return Client(
+            language="en-US",
+            proxy=self.proxy or None,
+            impersonate="chrome",
+        )
 
     async def ensure_login(self) -> bool:
         """登录或加载 cookie，确保账号可用。返回是否可用。"""

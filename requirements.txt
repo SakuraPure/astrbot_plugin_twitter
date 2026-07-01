@@ -1,2 +1,2 @@
-twikit>=2.3.0
+twifork>=2.3.4
 httpx[http2]>=0.25.0

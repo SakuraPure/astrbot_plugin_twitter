@@ -108,7 +108,12 @@ async def main():
     choice = _ask("输入选项 (1/2, 默认1): ", default="1")
 
     proxy = os.environ.get("TWITTER_PROXY") or ""
-    client = Client(language="en-US", proxy=proxy or None)
+    # impersonate 浏览器 TLS 指纹，规避 X 边缘对 httpx 原生指纹的 403
+    client = Client(
+        language="en-US",
+        proxy=proxy or None,
+        impersonate="chrome",
+    )
 
     if choice == "2":
         ok = await login_with_cookies(client, cookie_path)
