@@ -13,6 +13,14 @@ AstrBot Twitter 推文转发插件
   /推特测试 <推主id>                        - 立即获取并推送指定推主最新一条推文
   /推特最新 <推主id> <图片|视频|媒体>        - 获取指定推主最新一条指定类型的推文
 
+自然语言调用 (LLM 工具):
+  在 AI 对话中可用自然语言触发（需 AstrBot 已配置 LLM Provider 并开启函数调用）:
+  twitter_follow_user        - 订阅推主（"帮我关注一下 xxx 的推特"）
+  twitter_unfollow_user      - 取关推主（"取关 xxx"）
+  twitter_list_subscriptions - 查看订阅列表（"我关注了哪些推主"）
+  twitter_toggle_push        - 开关推送（"暂停推特推送"）
+  twitter_fetch_latest_tweet - 获取最新推文（"看看 xxx 的最新推文/图片/视频"）
+
 配置项:
   【基础设置】
     twikit cookie 路径 (twitter_twikit_cookies_path) - 如 data/twikit_cookies.json
@@ -1304,6 +1312,133 @@ class TwitterPlugin(Star):
             logger.error(f"获取 {username} 推文异常: {e}")
             return False
 
+    # ========== 核心业务逻辑（指令与 LLM 工具共用） ==========
+
+    async def _subscribe_author(
+        self, subs: dict, umo: str, username: str, r18: bool, media_only: bool
+    ) -> dict:
+        """订阅核心逻辑：校验推主并写入 subs（调用方负责保存）
+
+        返回 {"ok": bool, "error": str, "screen_name": str, "bio": str}
+        """
+        username = username.strip("@").strip()
+        try:
+            user_info = await self.twitter_api.get_user_info(username)
+            if not user_info["status"]:
+                return {"ok": False, "error": "未找到用户", "screen_name": "", "bio": ""}
+
+            latest_ids = await self.twitter_api.get_user_newtimeline(username)
+        except Exception as e:
+            return {"ok": False, "error": f"订阅失败: {e}", "screen_name": "", "bio": ""}
+        since_id = latest_ids[-1] if latest_ids else ""
+
+        if username not in subs:
+            subs[username] = {
+                "screen_name": user_info["screen_name"],
+                "since_id": since_id,
+                "subscribers": {},
+            }
+
+        subs[username]["subscribers"][umo] = {
+            "status": True,
+            "r18": r18,
+            "media": media_only,
+        }
+        subs[username]["screen_name"] = user_info["screen_name"]
+        if since_id:
+            subs[username]["since_id"] = since_id
+
+        return {
+            "ok": True,
+            "error": "",
+            "screen_name": user_info["screen_name"],
+            "bio": user_info.get("bio", ""),
+        }
+
+    @staticmethod
+    def _unsubscribe_author(subs: dict, umo: str, username: str) -> str | None:
+        """取关核心逻辑：从 subs 移除订阅关系（调用方负责保存），成功返回 None"""
+        if username not in subs:
+            return "未订阅此推主"
+        if umo not in subs[username].get("subscribers", {}):
+            return "当前会话未订阅"
+
+        subs[username]["subscribers"].pop(umo)
+        # 如果该推主没有任何订阅者了，删除该推主
+        if not subs[username].get("subscribers", {}):
+            subs.pop(username)
+        return None
+
+    @staticmethod
+    def _list_subscription_lines(subs: dict, umo: str) -> list[str]:
+        """生成某会话的订阅列表行"""
+        lines = []
+        for username, info in subs.items():
+            subscribers = info.get("subscribers", {})
+            if umo not in subscribers:
+                continue
+            sub = subscribers[umo]
+            status_icon = "🟢" if sub.get("status", True) else "🔴"
+            r18_str = " | R18" if sub.get("r18") else ""
+            media_str = " | 仅媒体" if sub.get("media") else ""
+            screen_name = info.get("screen_name", username)
+            lines.append(
+                f"{status_icon} @{username} ({screen_name}){r18_str}{media_str}"
+            )
+        return lines
+
+    async def _set_push_status(self, umo: str, enabled: bool) -> int:
+        """开关某会话所有订阅的推送，返回受影响的订阅数"""
+        subs = await self._get_subs()
+        count = 0
+        for username in subs:
+            if umo in subs[username].get("subscribers", {}):
+                subs[username]["subscribers"][umo]["status"] = enabled
+                count += 1
+
+        if count > 0:
+            await self._save_subs(subs)
+        return count
+
+    async def _select_latest_tweet(
+        self, username: str, media_type: str | None = None
+    ) -> tuple[dict | None, str]:
+        """获取推主最新一条推文详情，可按媒体类型过滤，返回 (tweet_info, 错误信息)
+
+        media_type: None 不过滤 / "image" / "video" / "any"（图片或视频均可）
+        """
+        timeline_items = await self.twitter_api.get_user_timeline_items(username)
+        if not timeline_items:
+            return None, f"未找到 @{username} 的推文"
+
+        selected_item = None
+        for item in timeline_items:
+            if item.get("is_retweet") and not self.include_retweets:
+                continue
+            if media_type is None:
+                selected_item = item
+                break
+            item_media = item.get("media_type")
+            if media_type == "any":
+                if item_media in ("image", "video"):
+                    selected_item = item
+                    break
+            elif item_media == media_type:
+                selected_item = item
+                break
+
+        if not selected_item:
+            if media_type is None:
+                return None, f"未找到 @{username} 的非转贴推文"
+            type_label = {"image": "图片", "video": "视频", "any": "媒体"}[media_type]
+            return None, f"在 @{username} 最近的推文中未找到{type_label}推文"
+
+        tweet_id = str(selected_item.get("tweet_id") or "")
+        tweet_username = str(selected_item.get("username") or username)
+        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
+        self._attach_timeline_item_metadata(tweet_info, selected_item)
+        return tweet_info, ""
+
     # ========== 指令处理 ==========
 
     @filter.command("推特关注", alias={"twitter_follow"})
@@ -1325,51 +1460,26 @@ class TwitterPlugin(Star):
         r18 = "r18" in extra_args
         media_only = "媒体" in extra_args
 
-        # 获取用户信息
-        user_info = await self.twitter_api.get_user_info(username)
-        if not user_info["status"]:
-            yield event.plain_result(f"未找到用户: {username}")
-            return
-
-        # 获取最新推文 ID 作为 since_id
-        latest_ids = await self.twitter_api.get_user_newtimeline(username)
-        since_id = latest_ids[-1] if latest_ids else ""
-
+        # 获取用户信息并添加订阅
         umo = event.unified_msg_origin
-
-        # 添加订阅
         subs = await self._get_subs()
-        session_config = {
-            "status": True,
-            "r18": r18,
-            "media": media_only,
-        }
-
-        if username not in subs:
-            subs[username] = {
-                "screen_name": user_info["screen_name"],
-                "since_id": since_id,
-                "subscribers": {},
-            }
-
-        subs[username]["subscribers"][umo] = session_config
-        subs[username]["screen_name"] = user_info["screen_name"]
-        if since_id:
-            subs[username]["since_id"] = since_id
-
+        result = await self._subscribe_author(subs, umo, username, r18, media_only)
+        if not result["ok"]:
+            yield event.plain_result(f"{result['error']}: {username}")
+            return
         await self._save_subs(subs)
 
         r18_str = " | R18" if r18 else ""
         media_str = " | 仅媒体" if media_only else ""
-        bio = user_info["bio"][:100] + ("..." if len(user_info["bio"]) > 100 else "")
-        result = (
+        bio = result["bio"][:100] + ("..." if len(result["bio"]) > 100 else "")
+        result_text = (
             f"订阅成功!\n"
             f"ID: {username}\n"
-            f"昵称: {user_info['screen_name']}\n"
+            f"昵称: {result['screen_name']}\n"
             f"简介: {bio}\n"
             f"选项: {r18_str}{media_str}"
         )
-        yield event.plain_result(result)
+        yield event.plain_result(result_text)
 
     @filter.command("推特批量关注", alias={"twitter_batch_follow"})
     async def batch_follow_twitter(self, event: AstrMessageEvent):
@@ -1403,45 +1513,19 @@ class TwitterPlugin(Star):
         success_count = 0
 
         for username in usernames:
-            try:
-                # 获取用户信息
-                user_info = await self.twitter_api.get_user_info(username)
-                if not user_info["status"]:
-                    results.append(f"❌ @{username} - 未找到用户")
-                    continue
+            result = await self._subscribe_author(
+                subs, umo, username, r18, media_only
+            )
+            if not result["ok"]:
+                results.append(f"❌ @{username} - {result['error']}")
+                continue
 
-                # 获取最新推文 ID
-                latest_ids = await self.twitter_api.get_user_newtimeline(username)
-                since_id = latest_ids[-1] if latest_ids else ""
-
-                # 添加订阅
-                session_config = {
-                    "status": True,
-                    "r18": r18,
-                    "media": media_only,
-                }
-
-                if username not in subs:
-                    subs[username] = {
-                        "screen_name": user_info["screen_name"],
-                        "since_id": since_id,
-                        "subscribers": {},
-                    }
-
-                subs[username]["subscribers"][umo] = session_config
-                subs[username]["screen_name"] = user_info["screen_name"]
-                if since_id:
-                    subs[username]["since_id"] = since_id
-
-                success_count += 1
-                r18_str = " | R18" if r18 else ""
-                media_str = " | 仅媒体" if media_only else ""
-                results.append(
-                    f"✅ @{username} ({user_info['screen_name']}){r18_str}{media_str}"
-                )
-
-            except Exception as e:
-                results.append(f"❌ @{username} - 订阅失败: {e}")
+            success_count += 1
+            r18_str = " | R18" if r18 else ""
+            media_str = " | 仅媒体" if media_only else ""
+            results.append(
+                f"✅ @{username} ({result['screen_name']}){r18_str}{media_str}"
+            )
 
         # 一次性保存所有变更
         await self._save_subs(subs)
@@ -1464,19 +1548,10 @@ class TwitterPlugin(Star):
         umo = event.unified_msg_origin
 
         subs = await self._get_subs()
-        if username not in subs:
-            yield event.plain_result(f"未订阅推主: {username}")
+        err = self._unsubscribe_author(subs, umo, username)
+        if err:
+            yield event.plain_result(f"{err}: {username}")
             return
-
-        if umo not in subs[username].get("subscribers", {}):
-            yield event.plain_result(f"当前会话未订阅 {username}")
-            return
-
-        subs[username]["subscribers"].pop(umo)
-
-        # 如果该推主没有任何订阅者了，删除该推主
-        if not subs[username].get("subscribers", {}):
-            subs.pop(username)
 
         await self._save_subs(subs)
         yield event.plain_result(f"已取关 {username}")
@@ -1500,19 +1575,10 @@ class TwitterPlugin(Star):
         success_count = 0
 
         for username in usernames:
-            if username not in subs:
-                results.append(f"❌ @{username} - 未订阅此推主")
+            err = self._unsubscribe_author(subs, umo, username)
+            if err:
+                results.append(f"❌ @{username} - {err}")
                 continue
-
-            if umo not in subs[username].get("subscribers", {}):
-                results.append(f"❌ @{username} - 当前会话未订阅")
-                continue
-
-            subs[username]["subscribers"].pop(umo)
-
-            # 如果该推主没有任何订阅者了，删除该推主
-            if not subs[username].get("subscribers", {}):
-                subs.pop(username)
 
             success_count += 1
             results.append(f"✅ @{username} - 已取关")
@@ -1555,19 +1621,7 @@ class TwitterPlugin(Star):
         """查看当前订阅的推主列表"""
         umo = event.unified_msg_origin
         subs = await self._get_subs()
-
-        lines = []
-        for username, info in subs.items():
-            subscribers = info.get("subscribers", {})
-            if umo in subscribers:
-                sub = subscribers[umo]
-                status_icon = "🟢" if sub.get("status", True) else "🔴"
-                r18_str = " | R18" if sub.get("r18") else ""
-                media_str = " | 仅媒体" if sub.get("media") else ""
-                screen_name = info.get("screen_name", username)
-                lines.append(
-                    f"{status_icon} @{username} ({screen_name}){r18_str}{media_str}"
-                )
+        lines = self._list_subscription_lines(subs, umo)
 
         if not lines:
             yield event.plain_result("当前没有订阅任何推主")
@@ -1585,18 +1639,9 @@ class TwitterPlugin(Star):
             return
 
         enabled = action == "开启"
-        umo = event.unified_msg_origin
-
-        subs = await self._get_subs()
-        count = 0
-        for username in subs:
-            subscribers = subs[username].get("subscribers", {})
-            if umo in subscribers:
-                subs[username]["subscribers"][umo]["status"] = enabled
-                count += 1
+        count = await self._set_push_status(event.unified_msg_origin, enabled)
 
         if count > 0:
-            await self._save_subs(subs)
             status_text = "开启" if enabled else "关闭"
             yield event.plain_result(f"推文推送已{status_text} (影响 {count} 个订阅)")
         else:
@@ -1620,28 +1665,10 @@ class TwitterPlugin(Star):
         yield event.plain_result(f"正在获取 @{username} 的最新推文，请稍候...")
 
         # 获取时间线并按配置选择最新推文
-        timeline_items = await self.twitter_api.get_user_timeline_items(username)
-        if not timeline_items:
-            yield event.plain_result(f"未找到 @{username} 的推文")
+        tweet_info, err = await self._select_latest_tweet(username)
+        if err:
+            yield event.plain_result(err)
             return
-
-        selected_item = None
-        for item in timeline_items:
-            if item.get("is_retweet") and not self.include_retweets:
-                continue
-            selected_item = item
-            break
-
-        if not selected_item:
-            yield event.plain_result(f"未找到 @{username} 的非转贴推文")
-            return
-
-        tweet_id = str(selected_item.get("tweet_id") or "")
-        tweet_username = str(selected_item.get("username") or username)
-
-        # 获取推文详情
-        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
-        self._attach_timeline_item_metadata(tweet_info, selected_item)
 
         # 翻译推文
         translated_text, translate_model = await self._maybe_translate(
@@ -1714,36 +1741,10 @@ class TwitterPlugin(Star):
         yield event.plain_result(f"正在获取 @{username} 的最新{type_label}推文，请稍候...")
 
         # 获取时间线（最新在前），按媒体类型寻找命中的推文
-        timeline_items = await self.twitter_api.get_user_timeline_items(username)
-        if not timeline_items:
-            yield event.plain_result(f"未找到 @{username} 的推文")
+        tweet_info, err = await self._select_latest_tweet(username, media_type)
+        if err:
+            yield event.plain_result(err)
             return
-
-        selected_item = None
-        for item in timeline_items:
-            if item.get("is_retweet") and not self.include_retweets:
-                continue
-            item_media = item.get("media_type")
-            if media_type == "any":
-                if item_media in ("image", "video"):
-                    selected_item = item
-                    break
-            elif item_media == media_type:
-                selected_item = item
-                break
-
-        if not selected_item:
-            yield event.plain_result(
-                f"在 @{username} 最近的推文中未找到{type_label}推文"
-            )
-            return
-
-        tweet_id = str(selected_item.get("tweet_id") or "")
-        tweet_username = str(selected_item.get("username") or username)
-
-        # 获取推文详情
-        tweet_info = await self.twitter_api.get_tweet(tweet_username, tweet_id)
-        self._attach_timeline_item_metadata(tweet_info, selected_item)
 
         # 翻译推文
         translated_text, translate_model = await self._maybe_translate(
@@ -1765,6 +1766,167 @@ class TwitterPlugin(Star):
         screen_name = str(tweet_info.get("screen_name") or author_username)
         nickname = self._build_author_display(author_username, screen_name)
         await self._dispatch_tweet_chain(umo, chain, nickname)
+
+    # ========== LLM 工具（自然语言调用） ==========
+    # 通过 @filter.llm_tool 暴露给 AstrBot 的 LLM，用户在 AI 对话中用自然语言即可触发。
+    #
+    # 工具内 yield 纯字符串 → 作为工具结果回传给模型（不直接发给用户），
+    # 由模型组织语言回复；推文这类富媒体内容通过 _dispatch_tweet_chain 直接发到会话。
+
+    @filter.llm_tool(name="twitter_follow_user")
+    async def tool_follow_user(
+        self,
+        event: AstrMessageEvent,
+        username: str = "",
+        r18: bool = False,
+        media_only: bool = False,
+    ):
+        '''订阅（关注）一个推特/Twitter/X 推主，订阅后其新推文会自动推送到当前会话。当用户表达想关注、订阅某个推特推主时调用。
+
+        Args:
+            username(string): 推主用户名，即主页链接或 @ 后面的 ID，不含 @
+            r18(boolean): 是否接收 R18 敏感内容，用户未提及时传 false
+            media_only(boolean): 是否只推送含图片/视频的推文，用户未提及时传 false
+        '''
+        if not self.twitter_api.available:
+            yield "推特账号未登录，无法订阅。请告知用户检查 twikit cookie 或账号密码配置。"
+            return
+
+        username = (username or "").strip("@").strip()
+        if not username:
+            yield "缺少推主ID，请向用户询问要关注的推主用户名。"
+            return
+
+        subs = await self._get_subs()
+        result = await self._subscribe_author(
+            subs, event.unified_msg_origin, username, r18, media_only
+        )
+        if not result["ok"]:
+            yield f"订阅 @{username} 失败：{result['error']}。请把失败原因告诉用户。"
+            return
+        await self._save_subs(subs)
+
+        opts = [s for s, on in (("R18", r18), ("仅媒体", media_only)) if on]
+        opt_str = f"（选项: {'、'.join(opts)}）" if opts else ""
+        yield (
+            f"已成功订阅 @{username}（昵称: {result['screen_name']}）{opt_str}，"
+            f"其新推文将自动推送到当前会话。请把订阅结果告诉用户。"
+        )
+
+    @filter.llm_tool(name="twitter_unfollow_user")
+    async def tool_unfollow_user(self, event: AstrMessageEvent, username: str = ""):
+        '''取消订阅（取关）一个推特/Twitter/X 推主，当前会话不再接收其推文推送。当用户表达想取关、退订某个推特推主时调用。
+
+        Args:
+            username(string): 推主用户名，即主页链接或 @ 后面的 ID，不含 @
+        '''
+        username = (username or "").strip("@").strip()
+        if not username:
+            yield "缺少推主ID，请向用户询问要取关的推主用户名。"
+            return
+
+        subs = await self._get_subs()
+        err = self._unsubscribe_author(subs, event.unified_msg_origin, username)
+        if err:
+            yield f"取关 @{username} 失败：{err}。请把失败原因告诉用户。"
+            return
+
+        await self._save_subs(subs)
+        yield f"已取关 @{username}，当前会话不再接收其推文推送。请把结果告诉用户。"
+
+    @filter.llm_tool(name="twitter_list_subscriptions")
+    async def tool_list_subscriptions(self, event: AstrMessageEvent):
+        '''列出当前会话订阅的所有推特/Twitter/X 推主（含推送开关、R18、仅媒体等选项）。当用户问"我关注了哪些推主""订阅列表"时调用。
+        '''
+        subs = await self._get_subs()
+        lines = self._list_subscription_lines(subs, event.unified_msg_origin)
+        if not lines:
+            yield "当前会话没有订阅任何推主。可以引导用户用自然语言或 /推特关注 指令订阅。"
+            return
+        yield (
+            "当前会话的订阅列表（🟢 推送开启 / 🔴 推送关闭）:\n"
+            + "\n".join(lines)
+            + "\n请把订阅情况整理后告诉用户。"
+        )
+
+    @filter.llm_tool(name="twitter_toggle_push")
+    async def tool_toggle_push(self, event: AstrMessageEvent, enabled: bool = True):
+        '''开启或关闭当前会话所有推特订阅的推文推送。当用户说"暂停/恢复推特推送""别再推了"等时调用。
+
+        Args:
+            enabled(boolean): true 表示开启推送，false 表示关闭推送
+        '''
+        count = await self._set_push_status(event.unified_msg_origin, enabled)
+        if count <= 0:
+            yield "当前会话没有订阅任何推主，无推送可设置。请把这一情况告诉用户。"
+            return
+        status_text = "开启" if enabled else "关闭"
+        yield f"已{status_text}推文推送，影响 {count} 个订阅。请把结果告诉用户。"
+
+    @filter.llm_tool(name="twitter_fetch_latest_tweet")
+    async def tool_fetch_latest_tweet(
+        self, event: AstrMessageEvent, username: str = "", media_type: str = ""
+    ):
+        '''获取指定推特/Twitter/X 推主的最新一条推文，并把推文内容（含图片/视频）直接发送到当前会话。无需订阅即可使用。当用户想看某推主的最新推文、最新图片或最新视频时调用。
+
+        Args:
+            username(string): 推主用户名，即主页链接或 @ 后面的 ID，不含 @
+            media_type(string): 媒体类型过滤，可选值: "图片"、"视频"、"媒体"（图片或视频均可）；用户未指定类型时传空字符串
+        '''
+        if not self.twitter_api.available:
+            yield "推特账号未登录，无法获取推文。请告知用户检查 twikit cookie 或账号密码配置。"
+            return
+
+        username = (username or "").strip("@").strip()
+        if not username:
+            yield "缺少推主ID，请向用户询问推主用户名。"
+            return
+
+        type_map = {
+            "图片": "image", "image": "image",
+            "视频": "video", "video": "video",
+            "媒体": "any", "any": "any",
+        }
+        filter_type = type_map.get((media_type or "").strip().lower())
+
+        umo = event.unified_msg_origin
+        try:
+            tweet_info, err = await self._select_latest_tweet(username, filter_type)
+        except Exception as e:
+            logger.error(f"LLM 工具获取 @{username} 推文异常: {e}")
+            yield f"获取 @{username} 的推文失败：{e}。请把失败原因告诉用户。"
+            return
+        if err:
+            yield f"{err}。请把这一情况告诉用户。"
+            return
+
+        translated_text, translate_model = await self._maybe_translate(
+            tweet_info, umo
+        )
+        chain = await self._build_tweet_message_chain(
+            username, tweet_info,
+            {"r18": True, "media": False, "status": True},
+            translated_text=translated_text,
+            translate_model=translate_model,
+        )
+        if not chain:
+            yield f"未能构建 @{username} 的推文内容。请把这一情况告诉用户。"
+            return
+
+        author_username = str(tweet_info.get("username") or username)
+        screen_name = str(tweet_info.get("screen_name") or author_username)
+        nickname = self._build_author_display(author_username, screen_name)
+        sent = await self._dispatch_tweet_chain(umo, chain, nickname)
+        if not sent:
+            yield f"@{username} 的推文发送失败。请把这一情况告诉用户。"
+            return
+
+        text_preview = str(tweet_info.get("text") or "")[:100]
+        yield (
+            f"已把 @{username}（{screen_name}）的最新推文发送到当前会话，"
+            f"内容摘要: {text_preview}\n"
+            f"推文本体已发出，你只需简短告知用户即可，不要复述推文内容。"
+        )
 
     # ========== 链接识别 ==========
 
